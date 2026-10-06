@@ -1451,6 +1451,11 @@ func doctorMCP(w io.Writer) {
 		if trust != "" {
 			fmt.Fprintf(w, "  %-12s %s\n", "", trust)
 		}
+		if c.name == "codebuddy" {
+			if note := codeBuddyPluginNote(); note != "" {
+				fmt.Fprintf(w, "  %-12s %s\n", "", note)
+			}
+		}
 		// One "wired" can be two registrations: a hand add under another name
 		// — the project is called deja-vu, after all — plus the `deja` a later
 		// install wrote beside it. Each session then starts the server twice
@@ -1961,7 +1966,7 @@ type doctorMCPConfig struct {
 }
 
 func doctorMCPConfigs() []doctorMCPConfig {
-	return []doctorMCPConfig{
+	configs := []doctorMCPConfig{
 		{"claude-code", sources.ClaudeJSONPath(), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
 		{"codex", filepath.Join(sources.CodexHome(), "config.toml"), doctorTOMLWired, doctorTOMLDejaKeys},
 		{"opencode", doctorOpencodeConfigPath(), doctorJSONWiredIn(doctorOpencodeServers), doctorJSONDejaKeysIn(doctorOpencodeServers)},
@@ -2007,6 +2012,11 @@ func doctorMCPConfigs() []doctorMCPConfig {
 		// loaded it from is the file that says so.
 		{"reasonix", reasonixInstalledManifest(), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
 	}
+	// One row per TRAE IDE build on this machine; each reads its own file.
+	for _, e := range traeIDEPresent() {
+		configs = append(configs, doctorMCPConfig{"trae-ide", e.mcpPath(), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")})
+	}
+	return configs
 }
 
 // dshPatchPath is the home-level patch layer installDeepSeek writes.

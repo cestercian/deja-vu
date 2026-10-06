@@ -34,8 +34,14 @@ func Search(dir string, o query.Options) ([]model.Session, error) {
 
 func SearchDetailed(dir string, o query.Options) (SearchResult, error) {
 	r, err := searchDetailedOnce(dir, o)
-	if err != nil || len(r.Sessions) > 0 || o.Regex {
+	if err != nil || o.Regex {
 		return r, err
+	}
+	if len(r.Sessions) > 0 {
+		if r.Tier != query.TierExact {
+			return withDirectorySessions(dir, o, r), nil
+		}
+		return r, nil
 	}
 	// A question that embeds a quoted phrase ("when did I read \"x y\"?")
 	// and matched nothing anywhere: the phrase kept its exactness contract,
@@ -62,7 +68,7 @@ func SearchDetailed(dir string, o query.Options) (SearchResult, error) {
 			}
 		}
 	}
-	return r, err
+	return withDirectorySessions(dir, o, r), nil
 }
 
 var quotedSpanRE = regexp.MustCompile(`"[^"]*"`)
@@ -219,16 +225,20 @@ func searchDetailedOnce(dir string, o query.Options) (SearchResult, error) {
 		ss, err := scanRecords(dir, m, o, nil)
 		return SearchResult{Sessions: ss, Tier: fallbackTier, Variants: fallbackVariants}, err
 	}
+	// When every session holding the words is filtered out — most often the
+	// agent's own live session, which holds them because the question came
+	// from it — the answer is still the rest of the ladder, not nothing. The
+	// early return here served empty to 23 of 255 real recall calls (#4766).
 	posts = cutPostingsBySession(posts, m, o)
-	if len(posts) == 0 {
-		return SearchResult{}, nil
+	var ss []model.Session
+	if len(posts) > 0 {
+		// With the variants the rung above collected, not without them. A
+		// substring variant needs none — the text holding "opencode" holds
+		// "code" too — but a compound spelled apart is not a substring of
+		// anything the store wrote, so the postings found the session and
+		// this check dropped it again (#2125).
+		ss, err = scanRecordsWithVariants(dir, m, o, postingOffsets(posts), fallbackVariants)
 	}
-	// With the variants the rung above collected, not without them. A
-	// substring variant needs none — the text holding "opencode" holds "code"
-	// too — but a compound spelled apart is not a substring of anything the
-	// store wrote, so the postings found the session and this check dropped it
-	// again (#2125).
-	ss, err := scanRecordsWithVariants(dir, m, o, postingOffsets(posts), fallbackVariants)
 	if err == nil && len(ss) == 0 {
 		if result, ferr := stemSearch(dir, m, o); ferr != nil {
 			return SearchResult{}, fmt.Errorf("stem postings: %w", ferr)
@@ -2088,6 +2098,35 @@ func RecentProjectsUnder(dir string, projects []string, root string, perName int
 	if err != nil {
 		return nil, err
 	}
+	return sessionsForMetas(dir, recentProjectMetas(m, projects, root, perName))
+}
+
+// RecentProjectMetasUnder is RecentProjectsUnder without the records, and
+// only for sessions updated since the given time: the manifest rows alone,
+// for a caller that picks one before it reads any text. The time cut comes
+// first, so the scope rules run over a handful of rows rather than the store.
+func RecentProjectMetasUnder(dir string, projects []string, root string, since time.Time, perName int) ([]SessionMeta, error) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	m, err := readManifestCached(dir)
+	if err != nil {
+		return nil, err
+	}
+	fresh := make(map[string]SessionMeta)
+	for k, meta := range m.Sessions {
+		if !meta.Updated.Before(since) {
+			fresh[k] = meta
+		}
+	}
+	if len(fresh) == 0 {
+		return nil, nil
+	}
+	m.Sessions = fresh
+	return recentProjectMetas(m, projects, root, perName), nil
+}
+
+func recentProjectMetas(m Manifest, projects []string, root string, perName int) []SessionMeta {
 	seen := map[string]bool{}
 	var metas []SessionMeta
 	for _, project := range projects {
@@ -2126,7 +2165,7 @@ func RecentProjectsUnder(dir string, projects []string, root string, perName int
 		}
 		metas = append(metas, under...)
 	}
-	return sessionsForMetas(dir, metas)
+	return metas
 }
 
 // metasWorkingUnder is the sessions whose touched files sit under root and
@@ -2781,7 +2820,7 @@ func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []
 	by := map[string]*model.Session{}
 	add := func(r Record) {
 		meta, ok := m.Sessions[r.Key]
-		if !ok {
+		if !ok || o.ExcludeSessions[meta.ID] {
 			return
 		}
 		if o.Harness != "" && !harnessMatches(meta.Harness, o.Harness) {
@@ -4024,6 +4063,10 @@ func closeTokens(query string, idx *tokenIndex) []string {
 	// behind a word that merely lost its vowels, and the eight-variant cap
 	// below must not fill with them.
 	for _, token := range idx.markedFormsOf(query) {
+		consider(token, 1)
+	}
+	// The same for ä, ö, ü and ß against their ASCII spellings (#4690).
+	for _, token := range idx.digraphFormsOf(query) {
 		consider(token, 1)
 	}
 	sort.Slice(matches, func(i, j int) bool {

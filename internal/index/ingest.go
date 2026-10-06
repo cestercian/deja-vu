@@ -1536,7 +1536,7 @@ func publishNewestFirst(dir string, ss []model.Session, progress io.Writer) {
 	}
 	newest := append([]model.Session(nil), ss...)
 	sort.Slice(newest, func(i, j int) bool { return newest[i].Updated.After(newest[j].Updated) })
-	newest = newest[:partialPublishSessions]
+	newest = newest[:newestSlice(newest)]
 	tmp := dir + ".part"
 	_ = os.RemoveAll(tmp)
 	if err := os.MkdirAll(filepath.Join(tmp, "buckets"), 0o700); err != nil {
@@ -1564,10 +1564,32 @@ func publishNewestFirst(dir string, ss []model.Session, progress io.Writer) {
 // pass, and partialPublishSessions how much of it lands first. A few hundred
 // sessions is what a person has touched recently enough to ask about, and it
 // writes in about a second where the whole corpus takes fourteen.
+//
+// partialPublishMessages bounds the slice by what it holds as well. The newest
+// sessions are the long ones still being worked in, and 200 of them can hold
+// more text than the rest of the store: on 3,871 sessions and 370k messages
+// the slice took 28 s and the build 63 s, against 43 s with no slice at all
+// (#4768).
 const (
 	partialPublishFrom     = 400
 	partialPublishSessions = 200
+	partialPublishMessages = 20000
 )
+
+// newestSlice is how many of the newest-first sessions go into the early
+// index: up to partialPublishSessions, stopping once partialPublishMessages is
+// reached. The newest session always goes in, whatever it holds.
+func newestSlice(newest []model.Session) int {
+	n, msgs := 0, 0
+	for n < len(newest) && n < partialPublishSessions {
+		if n > 0 && msgs+len(newest[n].Messages) > partialPublishMessages {
+			break
+		}
+		msgs += len(newest[n].Messages)
+		n++
+	}
+	return n
+}
 
 func writeSessions(tmp, dir string, ss []model.Session, files map[string]FileState, scope string) error {
 	return writeSessionsWithSync(tmp, dir, ss, files, scope, importedState{compactions: compactionsForRebuild(dir, readTombstones())})
@@ -3805,8 +3827,38 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 	arrivedDirs := sessionDirsUnder(changed)
 	superseded := supersededLogs(removed, files)
 	kept := map[string]bool{}
+	// Kept while still on disk: a store this run cannot see, so not deleted.
+	unseen := map[string]bool{}
+	var view *listedView
 	for p := range removed {
-		if superseded[p] || !deletedFromLiveStore(p) {
+		if superseded[p] {
+			continue
+		}
+		// A file still on disk that the listing left out was not deleted. When
+		// this pass read the session it hangs off — a file of the same store
+		// one or two directories up — the store was in view and a setting left
+		// the file out: DEJA_INCLUDE_SUBAGENTS turned off. It goes, as a
+		// rebuild would drop it; the incremental pass kept 32 children and
+		// called them "no longer on disk" (#4739). Otherwise its store is
+		// outside this run's view — a hook started with a stripped environment
+		// (#4738), a root no longer set — and that is no reason to drop the
+		// store's sessions, so they stay.
+		if _, err := os.Lstat(p); err == nil {
+			if view == nil {
+				view = newListedView(files, old.Sessions)
+			}
+			if view.leftOutBySetting(p) {
+				continue
+			}
+			if of, ok := old.Files[p]; ok {
+				files[p] = of
+				delete(removed, p)
+				kept[p] = true
+				unseen[p] = true
+			}
+			continue
+		}
+		if !deletedFromLiveStore(p) {
 			continue
 		}
 		if d := goneSessionDir(p); d != "" && arrivedDirs[filepath.Base(d)] {
@@ -3822,8 +3874,20 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 	// say — except when nothing else changed, in which case there is no
 	// rename to filter and the pass returns early.
 	sayKept := func() {
-		if len(kept) > 0 && progress != nil {
-			fmt.Fprintf(progress, "deja: %d transcript%s no longer on disk — still searchable; `deja forget <id>` drops one for good\n", len(kept), pluralS(len(kept)))
+		if progress == nil {
+			return
+		}
+		out := 0
+		for p := range kept {
+			if unseen[p] {
+				out++
+			}
+		}
+		if n := len(kept) - out; n > 0 {
+			fmt.Fprintf(progress, "deja: %d transcript%s no longer on disk — still searchable; `deja forget <id>` drops one for good\n", n, pluralS(n))
+		}
+		if out > 0 {
+			fmt.Fprintf(progress, "deja: %d transcript%s outside the stores this run reads — still searchable\n", out, pluralS(out))
 		}
 	}
 	// Counted after the keep-backs above: records that came off an unmounted
